@@ -1,0 +1,453 @@
+import os, sys, glob
+from pyspark.sql import Window
+from pyspark.sql.functions import *
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import logging
+import logging.config
+from pyspark import SparkConf
+import configparser
+import pandas as pd
+import datetime as dt
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+
+pd.set_option('max_columns', None)
+os.environ['SPARK_HOME'] = '/opt/mapr/spark/spark'
+os.environ['PYSPARK_PYTHON'] = '/opt/python/python37/bin/python'
+spark_python = os.path.join(os.environ.get('SPARK_HOME', None), 'python')
+py4j = glob.glob(os.path.join(spark_python, 'lib', 'py4j-*.zip'))[0]
+sys.path[:0] = [spark_python, py4j]
+os.environ['PYTHONPATH'] = py4j
+from pyspark.sql import SparkSession
+
+db = "yang_base5"
+
+db2= "yang_lat"
+
+file_loc = f'log/Baseline_{datetime.now().strftime("%Y-%m-%d_%H:%M:%S")}.log'
+logging.config.fileConfig("configs/logging_config.conf",
+                          defaults={'logfilename': file_loc})
+
+def get_spark_app_config():
+    spark_conf = SparkConf()
+    config = configparser.ConfigParser()
+    config.read('configs/spark.conf')
+
+    for (key, val) in config.items("SPARK_APP_CONFIGS"):
+        spark_conf.set(key, val)
+    return spark_conf
+def create_spark_session():
+        try:
+            conf = get_spark_app_config()
+            sparkSession = SparkSession \
+                .builder \
+                .config(conf=conf) \
+                .config("spark.jars",
+                        "/axp/platform/cloak/lib/cloak-spark.jar,/axp/platform/mlplat/app/spy/hive-contrib.jar") \
+                .enableHiveSupport() \
+                .getOrCreate()
+            sparkSession.sparkContext.setLogLevel("ERROR")
+            print("Spark session Created")
+            logging.info("Spark session Created")
+            return sparkSession
+        except Exception as exp:
+            print("An error occurred while creating spark session > " + str(exp))
+            logging.error("An error occurred while creating spark session > " + str(exp))
+            return 1
+
+
+class Baseline_new2:
+    def Baseline():
+        try:
+            print("Baseline started")
+            logging.info("Baseline started")
+            sparkSession.sql("CREATE DATABASE IF NOT EXISTS yang_base5 LOCATION 'maprfs:/axp/gms/ramptnt/dev/your_ads/yang_base5.db'")
+            logging.info("SE_MER_ID started")
+            SE_MER_ID = sparkSession.sql(""" SELECT t1.MER_ID, 
+                                    t1.MER_NO,
+                                    t1.Mer_ctry_cd,
+                                    t1.mer_srce_sys_cd,
+                                    t1.mer_hier_lvl_no
+                                    FROM cstonedb3.gmar_glbl_mer_info  t1
+                                    WHERE t1.MER_NO IN (select se from {db}.ncg_rcg_toc_list) """.
+                                    format(db=db2))
+
+            SE_MER_ID.createOrReplaceTempView("SE_MER_ID")
+            SE_MER_ID.write.mode("overwrite").saveAsTable("{db}.SE_MER_ID".format(db=db))
+
+            logging.info("lifs1 started")
+            lifs1 = sparkSession.sql("""select mer_id, mer_no, mer_id as managed_tocid
+                                from cstonedb3.gmar_glbl_mer_info  
+                                where trim(mer_id) IN (select mer_id from SE_MER_ID where mer_hier_lvl_no = 2)
+                                and trim(mer_srce_sys_cd) IN ('USD','CAD')
+                                and trim(mer_ctry_cd) IN ('840')""")
+            lifs1.createOrReplaceTempView("lifs1")
+            lifs1.write.mode("overwrite").saveAsTable("{db}.lifs1".format(db=db))
+
+
+            logging.info("lifs2 started")
+            lifs2 = sparkSession.sql("""select trim(mer_id) as mer_id,
+                            mer_no, immed_parnt_mer_id as managed_tocid
+                            from cstonedb3.gmar_glbl_mer_info  
+                            where trim(immed_parnt_mer_id) in (select trim(mer_id) from SE_MER_ID  where mer_hier_lvl_no = 6)
+                            and trim(mer_srce_sys_cd) in ('USD','CAD')
+                            and trim(mer_ctry_cd) in ('840')""")
+            lifs2.createOrReplaceTempView("lifs2")
+
+            lifs2 = sparkSession.sql(""" select a.mer_id,a.mer_no,a.managed_tocid from lifs2 a left join lifs1 b 
+                                on a.mer_id=b.mer_id
+                                where b.mer_id is null""")
+            lifs2.createOrReplaceTempView("lifs2")
+            lifs2.write.mode("overwrite").saveAsTable("{db}.lifs2".format(db=db))
+
+
+            logging.info("lifs_v1 started")
+            lifs_v1 = lifs2.union(lifs1)
+            lifs_v1.createOrReplaceTempView("lifs_v1")
+            lifs_v1.write.mode("overwrite").saveAsTable("{db}.lifs_v1".format(db=db))
+
+            logging.info("lifs3_temp started")
+            lifs3_temp = sparkSession.sql("""select mer_id, mer_no, mkt_toc_mer_no 
+                                    from cstonedb3.gmar_glbl_mer_info  
+                                    where trim(mkt_toc_mer_no) in (select trim(mer_no) from SE_MER_ID)
+                                    and trim(mer_srce_sys_cd) in ('USD','CAD')
+                                    and trim(mer_ctry_cd) in ('840')""")
+            lifs3_temp.createOrReplaceTempView("lifs3_temp")
+
+            lifs3_temp = sparkSession.sql(""" select a.mer_id,a.mer_no,a.mkt_toc_mer_no from lifs3_temp a left join lifs_v1 b 
+                                on a.mer_id=b.mer_id
+                                where b.mer_id is null""")
+
+            lifs3_temp.createOrReplaceTempView("lifs3_temp")
+
+            lifs3_temp.write.mode("overwrite").saveAsTable("{db}.lifs3_temp".format(db=db))
+
+            logging.info("lifs3 started")
+            lifs3 = sparkSession.sql("""select
+                                a.mer_id,
+                                a.mer_no,
+                                b.mer_id as managed_tocid
+                                from lifs3_temp a
+                                left join cstonedb3.gmar_glbl_mer_info   b
+                                on trim(a.mkt_toc_mer_no) = trim(b.mer_no)""")
+            lifs3.createOrReplaceTempView("lifs3")
+
+            lifs3.write.mode("overwrite").saveAsTable("{db}.lifs3".format(db=db))
+
+            logging.info("lifs started")
+            lifs = lifs_v1.union(lifs3)
+            lifs = lifs.sort("mer_id").dropDuplicates(["mer_id"])
+            lifs.createOrReplaceTempView("lifs")
+            lifs.write.mode("overwrite").saveAsTable("{db}.lifs".format(db=db))
+
+            logging.info("gen_lifs_pds started")
+            gen_lifs_pds = sparkSession.sql("""select b.mer_id,
+                                        b.mer_no,
+                                        a.mer_id as managed_tocid
+                                        from se_mer_id a
+                                        inner join  
+                                        cstonedb3.gmar_glbl_mer_info   b
+                                        on 
+                                        trim(a.mer_no) = trim(b.mkt_toc_mer_no)
+                                        and trim(b.mer_srce_sys_cd) = 'GEN'
+                                        and trim(b.mer_ctry_cd) in  ('840')""")
+
+            gen_lifs_pds.createOrReplaceTempView("gen_lifs_pds")
+
+            gen_lifs_pds = sparkSession.sql(""" select a.mer_id,a.mer_no,a.managed_tocid from gen_lifs_pds a left join lifs b 
+                                on a.mer_id=b.mer_id
+                                where b.mer_id is null""")
+
+            gen_lifs_pds.createOrReplaceTempView("gen_lifs_pds")
+            gen_lifs_pds.write.mode("overwrite").saveAsTable("{db}.gen_lifs_pds".format(db=db))
+
+            logging.info("lifs_2 started")
+            lifs_2 = lifs.union(gen_lifs_pds)
+            lifs_2.createOrReplaceTempView("lifs_2")
+
+            mo_id = 202111
+            logging.info("gen_lifs_gmwdm started")
+            gen_lifs_gmwdm = sparkSession.sql("""select mer_id,
+                                        mer_no,
+                                        IMMED_PARNT_MER_id as managed_tocid
+                                        from cstonedb3.gmar_glbl_mer_eom_snapshot a
+                                        where mo_id = {}
+                                        and trim(a.mer_srce_sys_cd) = 'GEN'
+
+                                        and a.IMMED_PARNT_MER_NO in (select mer_no from se_mer_id)
+                                        and trim(a.mer_cty_cd) in ('840')""".format(mo_id))
+
+            gen_lifs_gmwdm.createOrReplaceTempView("gen_lifs_gmwdm")
+
+            gen_lifs_gmwdm = sparkSession.sql("""select a.mer_id,a.mer_no,a.managed_tocid from gen_lifs_gmwdm a left join lifs_2 b 
+                                on a.mer_id=b.mer_id
+                                where b.mer_id is null""")
+
+            gen_lifs_gmwdm.createOrReplaceTempView("gen_lifs_gmwdm")
+
+            gen_lifs_gmwdm.write.mode("overwrite").saveAsTable("{db}.gen_lifs_gmwdm".format(db=db))
+
+            logging.info("lifs_2 started")
+            lifs_2 = lifs_2.union(gen_lifs_gmwdm)
+            lifs_2 = lifs_2.sort("mer_id").dropDuplicates(["mer_id"])
+            lifs_2.createOrReplaceTempView("lifs_2")
+            lifs_2.write.mode("overwrite").saveAsTable("{db}.lifs_2".format(db=db))
+
+            logging.info("lvl_8_missing_tocs_all_lifs started")
+            lvl_8_missing_tocs_all_lifs = sparkSession.sql("""select mer_id,
+                                                        mer_no,
+                                                        IMMED_PARNT_MER_id as managed_tocid,
+                                                        mer_hier_lvl_no
+                                                        from cstonedb3.gmar_glbl_mer_eom_snapshot
+                                                        where mo_id = {a}
+                                                        and trim(IMMED_PARNT_MER_ID) in (select trim(c.mer_id) from  ramp_yang.SE_MER_ID c where c.mer_hier_lvl_no =8)
+                                                        and trim(mer_cty_cd) = '840' """.format(a=mo_id,db=db))
+
+            lvl_8_missing_tocs_all_lifs.createOrReplaceTempView("lvl_8_missing_tocs_all_lifs")
+
+            lvl_8_missing_tocs_all_lifs = sparkSession.sql("""  select a.mer_id,a.mer_no,a.managed_tocid,mer_hier_lvl_no from lvl_8_missing_tocs_all_lifs a left join lifs_2 b 
+                                on a.mer_id=b.mer_id
+                                where b.mer_id is null""")
+
+            lvl_8_missing_tocs_all_lifs.createOrReplaceTempView("lvl_8_missing_tocs_all_lifs")
+
+            lvl_8_missing_tocs_all_lifs.write.mode("overwrite").saveAsTable("{db}.lvl_8_missing_tocs_all_lifs".format(db=db))
+
+            logging.info("lvl_8_missing_tocs_1 started")
+            lvl_8_missing_tocs_1 = sparkSession.sql("""select mer_id,
+                                                mer_no,
+                                                managed_tocid
+                                                from lvl_8_missing_tocs_all_lifs
+                                                where
+                                                mer_hier_lvl_no <= 6 """)
+
+            lvl_8_missing_tocs_1.createOrReplaceTempView("lvl_8_missing_tocs_1")
+
+            lvl_8_missing_tocs_1.write.mode("overwrite").saveAsTable("{db}.lvl_8_missing_tocs_1".format(db=db))
+
+            logging.info("lifs_new1 started")
+            lifs_new1 = lifs_2.union(lvl_8_missing_tocs_1)
+            lifs_new1.createOrReplaceTempView("lifs_new1")
+            lifs_new1.write.mode("overwrite").saveAsTable("{db}.lifs_new1".format(db=db))
+
+            logging.info("lvl_8_missing_tocs_2 started")
+            lvl_8_missing_tocs_2 = sparkSession.sql("""select
+                                                a.mer_id,
+                                                a.mer_no,
+                                                b.managed_tocid
+                                                from cstonedb3.gmar_glbl_mer_eom_snapshot a
+                                                inner join lvl_8_missing_tocs_all_lifs b
+                                                on trim(a.IMMED_PARNT_MER_id) = trim(b.MER_id)
+                                                where a.mo_id = {}
+                                                and trim(a.mer_cty_cd) = '840'
+                                                and b.mer_hier_lvl_no = 6""".format(mo_id))
+
+            lvl_8_missing_tocs_2.createOrReplaceTempView("lvl_8_missing_tocs_2")
+
+            lvl_8_missing_tocs_2 = sparkSession.sql("""select a.mer_id,a.mer_no,a.managed_tocid from lvl_8_missing_tocs_2 a left join lifs_new1 b 
+                                on a.mer_id=b.mer_id
+                                where b.mer_id is null""")
+
+            lvl_8_missing_tocs_2.createOrReplaceTempView("lvl_8_missing_tocs_2")
+
+            lvl_8_missing_tocs_2.write.mode("overwrite").saveAsTable("{db}.lvl_8_missing_tocs_2".format(db=db))
+
+            logging.info("lifs_new2 started")
+            lifs_new2 = lifs_new1.union(lvl_8_missing_tocs_2).sort("mer_id").dropDuplicates(["mer_id"])
+            lifs_new2.createOrReplaceTempView("lifs_new2")
+            lifs_new2.write.mode("overwrite").saveAsTable("{db}.lifs_new2".format(db=db))
+
+            logging.info("lifs_toc started")
+            lifs_toc = sparkSession.sql("""select a.*,b.mer_no as MKTOC 
+                                    from
+                                    lifs_new2 a 
+                                    left join 
+                                    SE_MER_ID b
+                                    on 
+                                    trim(a.managed_tocid) = trim(b.mer_id)""").sort("mer_id").dropDuplicates(["mer_id"])
+
+            lifs_toc = lifs_toc.sort("mer_id").dropDuplicates(["mer_id"])
+            lifs_toc.createOrReplaceTempView("lifs_toc")
+            lifs_toc.write.mode("overwrite").saveAsTable("{db}.lifs_toc".format(db=db))
+
+            logging.info("dual_afil_merid started")
+            dual_afil_merid = sparkSession.sql(""" select 
+                                            distinct b.mer_id as mer_id,
+                                            a.calc_prim_seno as mkt_toc_mer_no,
+                                            c.mer_id as managed_tocid
+                                            from 
+                                            {db}.dual_afil a 
+                                            left join 
+                                            cstonedb3.gmar_glbl_mer_info   b
+                                            on 
+                                            a.final_SENO=b.mer_no
+                                            left join 
+                                            lifs_toc d
+                                            on 
+                                            b.mer_id = d.mer_id
+                                            left join 
+                                            cstonedb3.gmar_glbl_mer_info   c
+                                            on 
+                                            a.calc_prim_seno = c.mer_no
+                                            where
+                                            d.mer_id is not null""".format(db=db2))
+            dual_afil_merid.createOrReplaceTempView("dual_afil_merid")
+            dual_afil_merid.write.mode("overwrite").saveAsTable("{db}.dual_afil_merid".format(db=db))
+
+            logging.info("dual_afil_exclude started")
+            dual_afil_exclude = sparkSession.sql("""select mer_id, mktoc as mkt_toc_mer_no, managed_tocid from lifs_toc """)
+
+            dual_afil_exclude.createOrReplaceTempView("dual_afil_exclude")
+
+            dual_afil_exclude = sparkSession.sql(""" select a.mer_id,a.mkt_toc_mer_no,a.managed_tocid from dual_afil_exclude a left join dual_afil_merid b 
+                                on a.mer_id=b.mer_id
+                                where b.mer_id is null""")
+
+            dual_afil_exclude.createOrReplaceTempView("dual_afil_exclude")
+
+            dual_afil_exclude.write.mode("overwrite").saveAsTable("{db}.dual_afil_exclude".format(db=db))
+
+            dual_afil_exclude= sparkSession.sql("""select * from {db}.dual_afil_exclude""".format(db=db))
+
+            dual_afil_merid= sparkSession.sql("""select * from {db}.dual_afil_merid""".format(db=db))
+
+            logging.info("final_lifs_list started") 
+            final_lifs_list = dual_afil_exclude.union(dual_afil_merid)
+
+            final_lifs_list.createOrReplaceTempView("final_lifs_list")
+
+            final_lifs_list.write.mode("overwrite").saveAsTable("{db}.final_lifs_list".format(db=db))
+
+            logging.info("select_lifs started")
+            select_lifs = sparkSession.sql("""select a.mer_id, b.mer_no,a.mkt_toc_mer_no, a.managed_tocid, 
+                                        c.segment
+                                        from 
+                                        final_lifs_list a
+                                        left join
+                                        cstonedb3.gmar_glbl_mer_info  b
+                                        on trim(a.mer_id) = trim(b.mer_id)
+                                        left join
+                                        {db}.ncg_rcg_toc_list c
+                                        on
+                                        a.mkt_toc_mer_no = c.se
+                                        where trim(b.mer_ctry_cd) = '840'""".format(db=db2))
+            select_lifs.createOrReplaceTempView("select_lifs")
+
+            select_lifs = select_lifs.withColumn("segment", when(select_lifs.segment == "US NATIONAL","NCG") \
+            .when(select_lifs.segment == "US REGIONAL","RCG") \
+            .when(select_lifs.segment == "US SM","SM") \
+            .when(col("segment").isNull(), "US UNMANAGED") \
+            .otherwise(select_lifs.segment))
+
+            select_lifs.createOrReplaceTempView("select_lifs")
+
+            select_lifs.write.mode("overwrite").saveAsTable("{db}.select_lifs".format(db=db))
+
+            logging.info("check started")
+            check = sparkSession.sql("""select a.*, b.mkt_toc_mer_no as PDS_TOC,
+                                case when trim(CRNT_MO_ACT_LIF_CD) = '1'  AND (trim(OPTBLUE_ACT_MER_IN) ='0' or trim(OPTBLUE_ACT_MER_IN) is NULL) then 1 else 0 end as ALIF,
+                                b.CRNT_YR_R12_MO_BUS_VOL_USD_AM AS CYR12DBV,
+                                b.crnt_ytd_tot_bus_vol_usd_am as CYYTDDBV,
+                                case when a.mkt_toc_mer_no = "PDS_TOC" THEN "Match" else "check" end  as validation
+                                from select_lifs a left join  cstonedb3.gmar_glbl_mer_info  b
+                                on trim(a.mer_id) = trim(b.mer_id)""")
+
+            check.createOrReplaceTempView("check")
+            check.write.mode("overwrite").saveAsTable("{db}.check".format(db=db))
+
+            logging.info("select_lifs_wd_ALIF started")
+            select_lifs_wd_ALIF = sparkSession.sql("""select a.*,
+                                                case when CRNT_MO_ACT_LIF_CD='1'  AND (trim(OPTBLUE_ACT_MER_IN) ='0' or trim(OPTBLUE_ACT_MER_IN) is NULL) then 1 else 0 end as ALIF2
+                                                from 
+                                                select_lifs a 
+                                                left join 
+                                                cstonedb3.gmar_glbl_mer_info   b
+                                                on 
+                                                a.mer_id = b.mer_id""")
+            select_lifs_wd_ALIF.createOrReplaceTempView("select_lifs_wd_ALIF")
+            select_lifs_wd_ALIF.write.mode("overwrite").saveAsTable("{db}.select_lifs_wd_ALIF".format(db=db))
+
+            logging.info("baseline_ncg_rcg_2022 started")
+            baseline_ncg_rcg_2022 = sparkSession.sql("""SELECT t1.mer_id, 
+                                                    t1.mer_no, 
+                                                    t1.mkt_toc_mer_no, 
+                                                    t1.managed_tocid, 
+                                                    t1.segment, 
+                                                    t1.ALIF
+                                                FROM check t1""")
+            baseline_ncg_rcg_2022.createOrReplaceTempView("baseline_ncg_rcg_2022")
+            baseline_ncg_rcg_2022.write.mode("overwrite").saveAsTable("{db}.baseline_ncg_rcg_2022".format(db=db))
+
+            logging.info("baseline_NCG_RCG_2022_with_flags started")
+            baseline_NCG_RCG_2022_with_flags = sparkSession.sql(""" select a.mer_no,a.mkt_toc_mer_no, b.mkt_toc_mer_lgl_nm, segment,
+                                                            a.alif,b.CRNT_YR_R12_MO_BUS_VOL_USD_AM AS CYR12DBV,
+                                                            b.crnt_ytd_tot_bus_vol_usd_am as CYYTDDBV,
+                                                            b.lif_mo_since_subm_ct,
+                                                            b.seims_indus_cd,
+                                                            (case when trim(b.seims_indus_cd) in ('266', '300', '301', '302', '303', '304', '306', '308', '309', '310', '311', '320', '330', '340', '388',
+                                                            '633', '796', '201', '202', '203', '204', '208', '211', '221', '222', '231', '240', '241', '242', '243', '244', '245', '248', '249', 
+                                                            '250', '267', '290', '299', 'C05', '003', '004','010', '072', '073', '074', '100', '101', '104', 
+                                                            '105', '106', '107', '108', '109', '114', '116', '118', '119', '120', '122', '123', '125', '127', '131', '136', '137', '138', '140',
+                                                            '141', '142', '145', '146', '147', '150', '152', '155', '157', '160', '162', '163', '164', '165', '166', '167', '168', '169', '170', '171', '172', '173', '174', '175', '176', '177',
+                                                            '178', '179', '180', '181', '182', '183', '184', '188', '199', '207', '604', 'A09', 'A12', 'C29', 'C30', 'C31', 'C32', 'C34', '001', '268', '386', '720', '778', '779', '780', '781',
+                                                            '782', '783', '784', '785', '786', '787', '885', '889', '305', '307', '315', '325', '335', '345', '387', '389', '390', '391', '392', '393', '394', '395', '396', '397', '398', '399',
+                                                            '436', '451', '723', '726', 'C16', 'C36', '023', '028', '040', '260', '700', '712', '714', '730', '731', '732', '733', '740', '741', '742', '743', '744', '745', '746', '751', '753',
+                                                            '754', '756', '757', '758', '760', '761', '762', '794', '982', '984', '985', '986', 'A03', 'C33', 'C42', '350', '352', '360', '362', '370', '372', '380', '382', '384', '385') then 1 else 0 end)
+                                                            as TE_flag ,
+                                                            (case when trim(b.seims_indus_cd) in ('591','627','654','665','682','900','927',
+                                                            '946','500','501','621','622','623','624','625','626','630','644',
+                                                            '646','647','648','659','660','661','687','689','694','696','725',
+                                                            '865','866','872','876','880','977','990','530','657','658','680',
+                                                            '683','688','869','916','944','947','307','672','673','674','709',
+                                                            '710','528','560','651','652','653','877','883','608','635','649',
+                                                            '666','699','715','770','886','919','934','958','964','978','605',
+                                                            '613','684','735','902','911','912','989','991','230','352','353',
+                                                            '668','678','931','485','677','920','945','971','216','462','483',
+                                                            '527','640','641','642','681','718','873','881','A01','349','451',
+                                                            '521','555','662','690','861','867','871','875','878','879','948',
+                                                            '686','914','486','645','663','685','691','692','693','695','864',
+                                                            'H01','H02','H04','A39','A40','A41','A42','A19','A20','A21','A22',
+                                                            'A23') then 1 else 0 end) as b2b_flag,
+                                                            (case when b.crnt_ytd_tot_bus_vol_usd_am <= 0 then 1 else 0 end ) as Zerobiller_flag
+                                                            from baseline_ncg_rcg_2022 a  left join cstonedb3.gmar_glbl_mer_info  b
+                                                            on trim(a.mer_id) = trim(b.mer_id)""")
+            baseline_NCG_RCG_2022_with_flags.createOrReplaceTempView("baseline_NCG_RCG_2022_with_flags")
+            baseline_NCG_RCG_2022_with_flags.write.mode("overwrite").saveAsTable("{db}.baseline_NCG_RCG_2022_with_flags".format(db=db))
+
+
+            logging.info("baseline_ncg_rccg_2022_final started")
+            baseline_ncg_rccg_2022_final = sparkSession.sql(""" SELECT t1.mer_no, 
+                                                        t1.mkt_toc_mer_no, 
+                                                        t1.mkt_toc_mer_lgl_nm, 
+                                                        t1.segment,
+                                                        t1.CYR12DBV, 
+                                                        t1.CYYTDDBV, 
+                                                        t1.lif_mo_since_subm_ct, 
+                                                        t1.seims_indus_cd, 
+                                                        t1.TE_flag, 
+                                                        t1.b2b_flag, 
+                                                        t1.Zerobiller_flag
+                                                    FROM baseline_ncg_rcg_2022_with_flags t1
+                                                    WHERE trim(t1.segment) NOT IN 
+                                                        (
+                                                        'GCG',
+                                                        'PAC'
+                                                        )""")
+            baseline_ncg_rccg_2022_final.write.mode("overwrite").saveAsTable("{db}.baseline_ncg_rccg_2022_final".format(db=db))
+
+        except Exception as exp:
+            print("An error occurred in Baseline")
+            logging.error("An error occurred in Baseline > " + str(exp))
+            print(exp)
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        pipeline = Baseline_new2
+        sparkSession = create_spark_session()
+        pipeline.Baseline()
+    except Exception as exp:
+        print(exp)
