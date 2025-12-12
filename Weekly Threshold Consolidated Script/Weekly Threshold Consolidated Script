@@ -1,0 +1,361 @@
+# ===================================================================================================================
+# Title             :   Email Alert and Incident Ticket generation for GCAP Data Issues.
+# Filename          :   Threshold_Alert.
+# Version No.       :   1.0.
+# Description       :   This program reads the PDS logs , Error data file and XML mapping file and creates content for
+#                   :   email and incident.Details will then be shared with SOR team.
+# Dependencies      :   threshold.cfg -> for configuration
+#                   :   mapping.csv -> for xml mapping
+# Created on        :   Feb 7 , 2017
+# ---------------------------------------------------------------------------------------------------
+# Change Log            Date(MM-DD-YYYY)        Description
+# ---------------------------------------------------------------------------------------------------
+# Madhusudhan            02-07-2019              Initial Draft
+#
+# ==================================================================================================================
+
+
+import datetime
+import shutil
+import subprocess
+import ast
+import csv
+import pymysql as MySq
+import os
+import smtplib
+import configparser
+import pandas as pd
+import argparse
+import string
+from csv import writer
+from email import encoders
+from email.mime.application import MIMEApplication
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# ---------- FUNCTIONS
+# ----------------------------------------------------------------------------------------------------------------------
+
+def get_file_and_contents(path1, path2):
+    print("In the process of getting file contents")
+    listdir = os.listdir(path1)
+    content_list=[]
+    for i in listdir:
+        if i.startswith("attempt"):
+            path = path1 + i + '/di_dataconverter_logs.log'
+
+            path_file = open(path, 'r', encoding="latin-1")
+            path_file_records = path_file.readlines()
+            temp_content = ''
+            pcn_list = get_impacted_pcnlist(path2)
+            pcn_list_str = ', '.join(pcn_list)
+            i = 0
+            #content_list=[]
+            for line in path_file_records:
+                if line.startswith(" for column"):
+                    if line != temp_content:
+                        xpath = get_xpath(line)
+                        temp_content = line
+                        i = i + 1
+                        content_list.append(xpath)
+                     
+            path_file.close()
+    return content_list
+    
+
+def vault():
+    
+    var1 = '5685ffd4-94ec-26bc-9df8-b5f390b54b44'
+    var2 = 'nadis'
+    output =os.popen('/axp/gcs/nadi/warehouse/dev/utilities/threshold_auto/bin/edge-shell-script.sh %s %s' % (str(var1),str(var2),),)
+    output2=output.read()
+    output.close()
+    new_output=output2.encode('utf-8')
+    start_pos = new_output.find('"data":'.encode()) + len('"data:"'.encode())    
+    end_post = new_output.find(',"zjson_end"'.encode())
+    json_chunk = new_output[start_pos:end_post]
+    ds=json_chunk.decode("utf-8")
+    ds=ds+'}'+'}'
+    data = ast.literal_eval(ds)
+    usr_silver=(data["data"]["usr_silver"])
+    pwd_silver=(data["data"]["pwd_silver"])
+    usr_gold=(data["data"]["usr_gold"])
+    pwd_gold=(data["data"]["pwd_gold"])
+
+    return usr_silver,pwd_silver,usr_gold,pwd_gold
+    
+
+def send_email(feedName,fileid):
+    print("Email Alert process")
+    msg = MIMEMultipart()
+    print("in send email :")
+    dt = datetime.datetime.now().strftime("%Y:%m:%d")
+    msg['Subject'] = 'SECURE:'"Go2 CS data issues weekly report - " + current_date
+        
+    me = "chandan.bhandari2@aexp.com"
+    you = "chandan.bhandari2@aexp.com"
+    cc = "chandan.bhandari2@aexp.com"
+   
+    msg['From'] = me
+    msg['To'] = you
+    msg['Cc'] = cc
+    content= """GCAP Team,<br><br>Attached report of Go2 threshold issues of last week.<br><br> Thanks"""
+    #content = content.replace("incxxxx", incTkt)
+    msg.attach(MIMEText(content, "html"))
+    with open('/axp/gcs/nadi/warehouse/dev/utilities/threshold_auto/list.csv','rb') as file:
+     attachment = MIMEBase('application', 'octet-stream')
+     attachment.set_payload(file.read())
+     encoders.encode_base64(attachment)
+     attachment.add_header('Content-Disposition', 'attachment; filename=Threshold_Report.csv')
+     msg.attach(attachment)
+     print("sending email")
+     s = smtplib.SMTP('localhost')
+     s.sendmail(me, msg['To'].split(",") + msg['Cc'].split(","), msg.as_string())
+     s.quit()
+
+def error_list(path1, path2):
+    print("In the process of getting file contents")
+    listdir = os.listdir(path1)
+    errorlist=[]
+    for i in listdir:
+        if i.startswith("attempt"):
+            path = path1 + i + '/di_dataconverter_logs.log'
+            path_file = open(path, 'r', encoding="latin-1")
+            path_file_records = path_file.readlines()
+            temp_content = ''
+            i = 0
+            #errorlist=[]
+            for line in path_file_records:
+                if line.startswith(" for column"):
+                    if line != temp_content:
+                        temp_content = line
+                        i = i+1
+                        content_error = line
+                        errorlist.append(content_error)            
+        # print(content)
+            path_file.close()
+    return errorlist
+
+def get_impacted_pcnlist(path2):
+    print("Getting Distinct Impacted PCN list")
+    print(path2)
+    fileList = os.listdir(path2)
+    finalPcnList = []
+    # print fileList
+    for i in fileList:
+        if i.startswith("part-m-"):
+            filePath = path2 + "/" + i
+            print(filePath)
+            fileRec = open(filePath, 'r', encoding="latin-1")
+            temp_pcn = ""
+            pcn_list_temp = []
+            for line in fileRec:
+                lineSplit = line.split("\x01\x05\x01")
+                for attr in lineSplit:
+                    if len(attr) == 17 and attr[-3:] in ("USD", "AUD", "CAD", "GBP", "HKD", "NOK", "036", "022"):
+                        if attr != temp_pcn:
+                            pcn_list_temp.append(attr)
+                            temp_pcn = attr
+            fileRec.close()
+            finalPcnList = pcn_list_temp + finalPcnList
+    return finalPcnList
+
+
+def get_xpath(line):
+    print("Getting Xpath for the issue attribute") 
+    str = line
+    temp1 = ""
+    for char in str.split(".")[0]:
+        if char != ".":
+            temp1 = temp1 + char
+    attrName = temp1.replace(" for column ", "")
+    mappingfilepath = basepath + "/threshold_auto/data/mapping.csv"
+    mappingDf = pd.read_csv(mappingfilepath, delimiter=",")
+    df2 = mappingDf[mappingDf["feed_attribute"] == attrName]
+    xml_content= df2.xml_path.to_list()
+    if len(xml_content) == 0 :
+       return "path_not_found"
+    print(xml_content)
+    return xml_content
+
+parser = argparse.ArgumentParser()
+parser.add_argument("env", help=" Pass the Environment where you want to execute the Code ")
+parser.add_argument("WORKDIR", help=" Pass the work directory ")
+parser.add_argument("Log_subdir", help=" Pass the first email id ")
+args = parser.parse_args()
+
+env = args.env
+WORKDIR = args.WORKDIR
+Log_subdir=args.Log_subdir
+
+timestamp=datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+logfile='Consolidated_Threshold_{}.log'.format(timestamp)
+print(logfile)
+log_file_path =os.path.join(args.WORKDIR,args.Log_subdir,logfile)
+print(log_file_path)
+os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+
+
+print("Environment" + env)
+print("workdir" + WORKDIR)
+print("logsubdir" + Log_subdir)
+
+if env == "MYSQL_SILVER":
+    #basepath = os.environ['HOME']
+    basepath = "/axp/gcs/nadi/warehouse/dev/utilities"
+    cslogpath = "cstonedbi"
+else:
+    basepath = "/axp/gcs/nadi/warehouse/dev/utilities"
+    cslogpath = "cstonedb"
+print ("basepath:" + basepath)
+
+temp_path = basepath + "/threshold_auto/data/temp_file.txt"
+config_file = basepath + "/threshold_auto/config/threshold.cfg"
+
+end_date=(datetime.datetime.now() - datetime.timedelta(hours=0)).strftime("%Y:%m:%d %H:%M:%S")
+
+with open('/axp/gcs/nadi/warehouse/dev/utilities/threshold_auto/data/temp_file.txt',"r") as end_date_object:
+    run_date=end_date_object.readlines()
+    run_date=run_date[0]
+    run_date=run_date.replace(',','').replace(':',':')
+       
+    print(run_date)
+
+    start_date=run_date
+
+#dt_tm_init = '2019-10-31 13:43:23'
+# ---------------------------------------
+# Reading config file
+# --------------------------------------
+print ("Reading Configuaration file")
+
+config = configparser.RawConfigParser()
+config.read(config_file)
+host1 = config.get(env, 'host')
+port1 = int(config.get(env, 'port'))
+db1 = config.get(env, 'db')
+usr_silver,pwd_silver,usr_gold,pwd_gold=vault()
+
+if  env == "MYSQL_SILVER":
+    #basepath = os.environ['HOME']
+    user1 = usr_silver
+    password1 = pwd_silver
+else:
+    user1 = usr_gold
+    password1 = pwd_gold
+
+# Connection to MYSQL database using Config parameters
+db = MySq.connect(host=host1, port=port1, user=user1, passwd=password1, db=db1)
+
+# Using the db object define the cursor
+c = db.cursor()
+
+# Query to pull data from MySQL table
+query = """select d.table_name,a.register_id , a.feed_id, a.file_id, a.run_count,  b.feed_name, now() as Timestamp , a.job_end_time  from 
+cstone_ingestion_ctrl a join cstone_feed b on a.feed_id = b.feed_id join cstone_lineage_table c
+on c.source_id = b.feed_id
+and source_type = 'INGEST'
+join cstone_storage d
+on d.storage_id = c.target_id  where a.register_id in (10731,7377,18645,19638) and a.feed_id 
+is not null and ( a.exception_message like '%Threshold%' OR a.exception_message like '%Input data file to DQM is empty%' )
+and a.job_end_time """
+
+#dt_tm_init = '2023-12-11 01:01:01'
+
+final_query = query + ">" + '"' + start_date + '"' + "  order by job_end_time "
+   
+with open('/axp/gcs/nadi/warehouse/dev/utilities/threshold_auto/data/temp_file.txt', 'w') as date_object:
+  writer_ob = writer(date_object)
+  writer_ob.writerow(end_date)
+  
+#  Execute Query
+print(final_query)
+row_cnt = c.execute(final_query)
+print('row_cnt:', row_cnt)
+# Fetch all data using the define query
+#print("runcount" + str(runcount))
+errInstance = 0
+if row_cnt > 0:
+    res = c.fetchall()
+    File = basepath + "/threshold_auto/data/output.txt"
+    OutputFile = open(File, 'w')
+    if os.path.exists("/axp/gcs/nadi/warehouse/dev/utilities/threshold_auto/list.csv"):
+        os.remove("/axp/gcs/nadi/warehouse/dev/utilities/threshold_auto/list.csv")
+    fields = ['Table_name','FeedName', 'File_id', 'PCNs','Xpaths','Errors','Incident','IncTime','Timestamp']  
+    filename = "/axp/gcs/nadi/warehouse/dev/utilities/threshold_auto/list.csv"
+    with open(filename, 'a',newline='') as csvfile:     
+     csvwriter = csv.writer(csvfile)  
+     csvwriter.writerow(fields)
+    for rowdata in res:
+        errInstance = errInstance + 1
+        print ("Getting Details for Error Instance :-->" + str(errInstance) + "\n")
+        row = ""
+        # print (rowdata)
+        Table_name=rowdata[0]
+        regid = rowdata[1]
+        feedid = rowdata[2]
+        fileid = rowdata[3]
+        runcnt = rowdata[4]
+        feedName = rowdata[5].replace("_bt_intl", "").strip()
+        Timestamp=rowdata[6]
+        
+        for fielddata in rowdata:
+            row = row + str(fielddata) + ','
+            x = str(fielddata)
+        
+        path1 = "/axp/platform/" + cslogpath + "/logs/cs3/" + str(regid) + "_" + str(feedid) + "/" + str(
+            fileid) + "_" + str(runcnt) + "/workflow/module_logs/platform_data_standardizer/"
+        path2 = "/axp/platform/" + cslogpath + "/cstonedb-stg/error_records/" + str(regid) + "_" + str(
+            feedid) + "/" + str(fileid) + "_" + str(runcnt) + "/error_records/platform_data_standardizer/"
+        path2dir = os.listdir(path2)
+        print("error log path: " + path1)
+        print("error data file path : " + path2)
+        query2 = "select ticket_number,incident_time from cstone_ingestion_incident_details  where request_id = "
+        final_query2 = query2 + str(fileid)
+        c.execute(final_query2)
+        res2 = c.fetchone()
+        #print(res2)
+        if res2[0] == None:
+            incTkt = 'NA'
+        else:
+            incTkt = res2[0]
+
+        if res2[1] == None:
+            incTime = 'NA'
+        else:
+            IncTime = res2[1]
+        #print(incTime)
+        # print("IncTkt", feedName,fileid)
+     
+        PCN_list=get_impacted_pcnlist(path2)
+        xpath=get_file_and_contents(path1, path2)
+        Error=error_list(path1, path2)
+        List = [Table_name,feedName,fileid,PCN_list,xpath,Error,incTkt,IncTime,Timestamp]
+        current_date=(datetime.datetime.now() - datetime.timedelta(hours=0)).strftime("%Y-%m-%d")
+        with open('/axp/gcs/nadi/warehouse/dev/utilities/threshold_auto/list.csv', 'a',newline='') as f_object:
+          writer_object = writer(f_object)
+          writer_object.writerow(List)
+        shutil.copyfile('/axp/gcs/nadi/warehouse/dev/utilities/threshold_auto/list.csv', '/axp/gcs/nadi/warehouse/dev/utilities/threshold_auto/Files/Threshold_Report_{}.csv'.format(current_date))
+        OutputFile.write(row.rstrip(",") + "\n")
+        
+          
+    OutputFile.close()
+    f_object.close()
+else:
+    print("No Error records for the current execution")
+   
+
+def email2():
+    try:
+       print("calling email()")
+       send_email(feedName,fileid)
+    except:
+       print("no records found")
+       
+       
+email2()
+
